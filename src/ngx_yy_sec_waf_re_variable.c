@@ -1,11 +1,3 @@
-/*
-** @file: ngx_yy_sec_waf_re_variable.c
-** @description: This is the rule engine's variables for yy sec waf.
-** @author: dw_liqi1<liqi1@yy.com>
-** @date: 2013.11.08
-** Copyright (C) YY, Inc.
-*/
-
 #include "ngx_yy_sec_waf_re.h"
 
 /*
@@ -51,6 +43,14 @@ yy_sec_waf_get_args(ngx_http_request_t *r,
         p.data = ngx_cpymem(p.data, ctx->args.data, ctx->args.len);
         p.data = ngx_cpymem(p.data, ",", 1);
         ngx_memcpy(p.data, ctx->post_args.data, ctx->post_args.len);
+    }
+
+    if (r->method == NGX_HTTP_POST) {
+        
+        ctx->raw_string = ctx->full_body;
+    } else if (r->method == NGX_HTTP_GET) {
+    
+        ctx->raw_string = &r->args;
     }
 
     v->valid = 1;
@@ -235,6 +235,58 @@ yy_sec_waf_get_multipart_filename(ngx_http_request_t *r,
 }
 
 /*
+** @description: This function is called to get multipart contenttype.
+** @para: ngx_http_request_t *r
+** @para: ngx_http_variable_value_t *v
+** @para: uintptr_t data
+** @return: NGX_OK or NGX_ERROR if failed.
+*/
+
+static ngx_int_t
+yy_sec_waf_get_multipart_content_type(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_uint_t                 i;
+    ngx_str_t                 *var;
+    u_char                    *p;
+    ngx_http_request_ctx_t    *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_yy_sec_waf_module);
+
+    if (ctx == NULL) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    var = ctx->content_type.elts;
+
+    for (i = 0; i < ctx->content_type.nelts; i++) {
+        v->len += var[i].len;
+    }
+
+    if (v->len == 0) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    v->data = ngx_palloc(r->pool, v->len);
+
+    p = v->data;
+
+    for (i = 0; i < ctx->content_type.nelts; i++) {
+        v->data = ngx_cpymem(v->data, var[i].data, var[i].len);
+    }
+
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->escape = 0;
+    v->not_found = 0;
+    v->data = p;
+
+    return NGX_OK;
+}
+
+/*
 ** @description: This function is called to get connection per ip.
 ** @para: ngx_http_request_t *r
 ** @para: ngx_http_variable_value_t *v
@@ -291,6 +343,9 @@ static ngx_http_variable_t var_metadata[] = {
       0, 0, 0 },
 
     { ngx_string("MULTIPART_FILENAME"), NULL, yy_sec_waf_get_multipart_filename,
+      0, 0, 0 },
+
+    { ngx_string("MULTIPART_CONTENT_TYPE"), NULL, yy_sec_waf_get_multipart_content_type,
       0, 0, 0 },
 
     { ngx_string("CONN_PER_IP"), NULL, yy_sec_waf_get_conn_per_ip,

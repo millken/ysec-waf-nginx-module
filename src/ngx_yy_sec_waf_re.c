@@ -1,16 +1,14 @@
-/*
-** @file: ngx_yy_sec_waf_re.c
-** @description: This is the rule engine for yy sec waf.
-** @author: dw_liqi1<liqi1@yy.com>
-** @date: 2013.07.15
-** Copyright (C) YY, Inc.
-*/
-
 #include "ngx_yy_sec_waf_re.h"
 
 static yy_sec_waf_re_t *rule_engine;
 
+static ngx_str_t yy_sec_waf_content_type = ngx_string("text/html");
+
 extern ngx_int_t ngx_local_addr(const char *eth, ngx_str_t *s);
+
+static ngx_int_t
+yy_sec_waf_re_process_block_list(ngx_http_request_t *r,
+    ngx_array_t *block_list, ngx_http_request_ctx_t *ctx);
 
 /*
 ** @description: This function is called to resolve tfns in hash.
@@ -98,62 +96,30 @@ static ngx_int_t
 yy_sec_waf_output_forbidden_page(ngx_http_request_t *r,
     ngx_http_request_ctx_t *ctx)
 {
-    ngx_str_t                       empty = ngx_string("");
-    ngx_str_t                      *tmp_uri;
     ngx_http_yy_sec_waf_loc_conf_t *cf;
+    ngx_http_complex_value_t        cv;
+    int                             status;
 
     cf = ngx_http_get_module_loc_conf(r, ngx_http_yy_sec_waf_module);
 
-    if (cf->denied_url) {
-        tmp_uri = ngx_pcalloc(r->pool, sizeof(ngx_str_t));
-        if (!tmp_uri)
-            return NGX_ERROR;
-        
-        tmp_uri->len = r->uri.len + (2 * ngx_escape_uri(NULL, r->uri.data, r->uri.len,
-            NGX_ESCAPE_ARGS));
-        tmp_uri->data = ngx_pcalloc(r->pool, tmp_uri->len+1);
-    
-        ngx_escape_uri(tmp_uri->data, r->uri.data, r->uri.len, NGX_ESCAPE_ARGS);
-        
-        ngx_table_elt_t *h;
-        
-        if (r->headers_in.headers.last)	{
-            h = ngx_list_push(&(r->headers_in.headers));
-            h->key.len = ngx_strlen("orig_url");
-            h->key.data = ngx_pcalloc(r->pool, ngx_strlen("orig_url")+1);
-            ngx_memcpy(h->key.data, "orig_url", ngx_strlen("orig_url"));
-            h->lowcase_key = ngx_pcalloc(r->pool, ngx_strlen("orig_url") + 1);
-            ngx_memcpy(h->lowcase_key, "orig_url", ngx_strlen("orig_url"));
-            h->value.len = tmp_uri->len;
-            h->value.data = ngx_pcalloc(r->pool, tmp_uri->len+1);
-            ngx_memcpy(h->value.data, tmp_uri->data, tmp_uri->len);
-            
-            h = ngx_list_push(&(r->headers_in.headers));
-            h->key.len = ngx_strlen("orig_args");
-            h->key.data = ngx_pcalloc(r->pool, ngx_strlen("orig_args")+1);
-            ngx_memcpy(h->key.data, "orig_args", ngx_strlen("orig_args"));
-            h->lowcase_key = ngx_pcalloc(r->pool, ngx_strlen("orig_args") + 1);
-            ngx_memcpy(h->lowcase_key, "orig_args", ngx_strlen("orig_args"));
-            h->value.len = r->args.len;
-            h->value.data = ngx_pcalloc(r->pool, r->args.len+1);
-            ngx_memcpy(h->value.data, r->args.data, r->args.len);
-            
-            h = ngx_list_push(&(r->headers_in.headers));
-            h->key.len = ngx_strlen("yy_sec_waf");
-            h->key.data = ngx_pcalloc(r->pool, ngx_strlen("yy_sec_waf")+1);
-            ngx_memcpy(h->key.data, "yy_sec_waf", ngx_strlen("yy_sec_waf"));
-            h->lowcase_key = ngx_pcalloc(r->pool, ngx_strlen("yy_sec_waf") + 1);
-            ngx_memcpy(h->lowcase_key, "yy_sec_waf", ngx_strlen("yy_sec_waf"));
-            h->value.len = empty.len;
-            h->value.data = empty.data;
-        }
+    status = ctx->status? ctx->status: NGX_HTTP_PRECONDITION_FAILED;
 
-        ngx_http_internal_redirect(r, cf->denied_url, &empty);
+    if (cf->denied_url.len != 0) {
 
-        return NGX_HTTP_OK;
-    } else {
-        return ctx->status? ctx->status: NGX_HTTP_PRECONDITION_FAILED;
+        ngx_memzero(&cv, sizeof(ngx_http_complex_value_t));
+
+        cv.value = cf->denied_url;
+
+        ngx_http_send_response(r, status, &yy_sec_waf_content_type, &cv);
+
+        /* we have to finalize the request by ourselves,
+               * that is because we use the "read client body" API */
+        //ngx_http_finalize_request(r, status);
+
+        return status;
     }
+
+    return status;
 }
 
 /*
@@ -185,6 +151,8 @@ yy_sec_waf_re_execute_operator(ngx_http_request_t *r,
         ctx->gids = rule->gids;
         ctx->msg = rule->msg;
         ctx->status = rule->status;
+        yy_sec_waf_re_process_block_list(r, ctx->cf->block_list, ctx);
+
         return RULE_MATCH;
     }
 
@@ -201,6 +169,13 @@ static ngx_int_t
 yy_sec_waf_re_perform_interception(ngx_http_request_ctx_t *ctx)
 {
 
+    if (ctx == NULL 
+        || ctx->raw_string == NULL
+        || ctx->real_client_ip == NULL
+        || ctx->server_ip == NULL) {
+        return NGX_DECLINED;
+    }
+
     ngx_atomic_fetch_add(request_matched, 1);
 
     ctx->process_done = 1;
@@ -214,16 +189,22 @@ yy_sec_waf_re_perform_interception(ngx_http_request_ctx_t *ctx)
     if (ctx->action_level & ACTION_BLOCK)
         ngx_atomic_fetch_add(request_blocked, 1);
 
+    size_t  len = ctx->raw_string->len;
+    u_char *p = ctx->raw_string->data;
+
+    if (len > NGX_MAX_ERROR_STR - 300) {
+        len = NGX_MAX_ERROR_STR - 300;
+        p[len++] = '.'; p[len++] = '.'; p[len++] = '.';
+    }
+
     if (ctx->action_level & ACTION_LOG) {
         ngx_log_error(NGX_LOG_ERR, ctx->r->connection->log, 0,
             "[ysec_waf] %s, id: %d,"
-            " matched: %uA, blocked: %uA, allowed: %uA, alerted: %uA,"
-            " var: %V, client_ip: %V, server_ip: %V",
+            " var: %*s, client_ip: %V, server_ip: %V",
             (ctx->action_level & ACTION_BLOCK)? "block":
             (ctx->action_level & ACTION_ALLOW)? "allow": "alert",
             ctx->rule_id,
-            *request_matched, *request_blocked, *request_allowed, *request_logged,
-            ctx->process_body_error? &ctx->process_body_error_msg: &ctx->var,
+            len, p,
             ctx->real_client_ip, ctx->server_ip);
     }
 
@@ -231,6 +212,60 @@ yy_sec_waf_re_perform_interception(ngx_http_request_ctx_t *ctx)
         return yy_sec_waf_output_forbidden_page(ctx->r, ctx);
 
     return NGX_DECLINED;
+}
+
+/*
+** @description: This function is called to process block list for yy sec waf.
+** @para: ngx_http_request_t *r
+** @para: ngx_http_yy_sec_waf_block_list_t *block_list
+** @para: ngx_http_request_ctx_t *ctx
+** @return: RULE_MATCH or RULE_NO_MATCH if failed.
+*/
+
+static ngx_int_t
+yy_sec_waf_re_process_block_list(ngx_http_request_t *r,
+    ngx_array_t *block_list, ngx_http_request_ctx_t *ctx)
+{
+    ngx_uint_t                        i;
+    ngx_int_t                         rc;
+    ngx_str_t                         str;
+    ngx_http_variable_value_t        *vv;
+    ngx_http_yy_sec_waf_block_list_t *block_list_p;
+
+	if (block_list == NULL || block_list->elts == NULL)
+		return NGX_ERROR;
+
+    block_list_p = (ngx_http_yy_sec_waf_block_list_t*)block_list->elts;
+    for (i = 0; i < block_list->nelts; ++i) {
+        vv = ngx_http_get_flushed_variable(r, block_list_p[i].idx);
+    
+        if (vv == NULL || vv->not_found || vv->len == 0) {
+            return NGX_AGAIN;
+        }
+    
+        if (ctx->action_level & ACTION_ALLOW) {
+            continue;
+        }
+
+        str.len = vv->len;
+        str.data = vv->data;
+    
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[ysec_waf] str:%V", &str);
+    
+        if (block_list_p[i].regex != NULL) {
+            /* REGEX */
+            rc = ngx_http_regex_exec(r, block_list_p[i].regex, &str);
+        
+            if (rc == NGX_OK) {
+                ctx->action_level &= ~ACTION_ALLOW;
+                ctx->action_level |= ACTION_BLOCK;
+                ctx->action_level |= ACTION_LOG;
+                return NGX_OK;
+            }
+        }
+    }
+
+    return NGX_ERROR;
 }
 
 /*
@@ -649,6 +684,69 @@ ngx_http_yy_sec_waf_re_read_conf(ngx_conf_t *cf,
 }
 
 /*
+** @description: This function is called to read block list of yy sec waf.
+** @para: ngx_conf_t *cf
+** @para: ngx_command_t *cmd
+** @para: void *conf
+** @return: NGX_CONF_OK or NGX_CONF_ERROR if failed.
+*/
+
+char *
+ngx_http_yy_sec_waf_re_block_list(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+    ngx_http_yy_sec_waf_loc_conf_t  *p = conf;
+
+    ngx_str_t                        *value;
+    ngx_regex_compile_t              *rgc;
+    ngx_http_yy_sec_waf_block_list_t *block_list_p;
+
+    value = cf->args->elts;
+
+    /* variable */
+    if (value[1].data[0] != '$') {
+        return NGX_CONF_ERROR;
+    }
+
+    if (p->block_list == NULL) {
+        p->block_list = ngx_array_create(cf->pool, 1, sizeof(ngx_http_yy_sec_waf_block_list_t));
+        if (!p->block_list) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+	block_list_p = ngx_array_push(p->block_list);
+    if (block_list_p == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    value[1].data++;
+    value[1].len--;
+
+	block_list_p->idx = ngx_http_get_variable_index(cf, &value[1]);
+	if (block_list_p->idx == NGX_ERROR) {
+		return NGX_CONF_ERROR;
+	}
+
+    /* regex */
+    rgc = ngx_pcalloc(cf->pool, sizeof(ngx_regex_compile_t));
+    if (!rgc)
+        return NGX_CONF_ERROR;
+
+    rgc->options = PCRE_CASELESS|PCRE_MULTILINE;
+    rgc->pattern = value[2];
+    rgc->pool = cf->pool;
+    rgc->err.len = 0;
+    rgc->err.data = NULL;
+
+    block_list_p->regex = ngx_http_regex_compile(cf, rgc);
+    if (block_list_p->regex == NULL)
+        return NGX_CONF_ERROR;
+
+    return NGX_CONF_OK;
+}
+
+/*
 ** @description: This function is called to read denied url of yy sec waf.
 ** @para: ngx_conf_t *cf
 ** @para: ngx_str_t *tmp
@@ -657,26 +755,68 @@ ngx_http_yy_sec_waf_re_read_conf(ngx_conf_t *cf,
 */
 
 char *
-ngx_http_yy_sec_waf_re_read_du_loc_conf(ngx_conf_t *cf,
+ngx_http_yy_sec_waf_re_read_denied_url_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf)
 {
     ngx_http_yy_sec_waf_loc_conf_t *p = conf;
-    ngx_str_t *value;
+    ngx_str_t                      *value;
+    ngx_int_t                       n;
+    size_t                          size;
+    ngx_file_t                      file;
+    ngx_file_info_t                 fi;
+    u_char                         *base;
 
     value = cf->args->elts;
     if (value[1].len == 0)
         return NGX_CONF_ERROR;
 
-    p->denied_url = ngx_pcalloc(cf->pool, sizeof(ngx_str_t));
-    if (!p->denied_url)
-        return NGX_CONF_ERROR;
+    if (p->denied_url.len != 0) {
+        return NGX_CONF_OK;
+    }
 
-    p->denied_url->data = ngx_pcalloc(cf->pool, value[1].len+1);
-    if (!p->denied_url->data)
-        return NGX_CONF_ERROR;
+    file.name = value[1];
+    file.log = cf->log;
+    file.fd = ngx_open_file(file.name.data, NGX_FILE_RDONLY,
+                            NGX_FILE_OPEN, NGX_FILE_DEFAULT_ACCESS);
 
-    ngx_memcpy(p->denied_url->data, value[1].data, value[1].len);
-    p->denied_url->len = value[1].len;
+    if (file.fd == NGX_INVALID_FILE) {
+        ngx_conf_log_error(NGX_LOG_ERR, cf, ngx_errno,
+                      ngx_open_file_n " \"%s\" failed", file.name.data);
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_fd_info(file.fd, &fi) == NGX_FILE_ERROR) {
+        ngx_conf_log_error(NGX_LOG_CRIT, cf, ngx_errno,
+                           ngx_fd_info_n " \"%s\" failed", file.name.data);
+        return NGX_CONF_ERROR;
+    }
+
+    size = (size_t) ngx_file_size(&fi);
+
+    if (ngx_file_info(file.name.data, &fi) == NGX_FILE_ERROR) {
+        ngx_conf_log_error(NGX_LOG_CRIT, cf, ngx_errno,
+                           ngx_file_info_n " \"%s\" failed", file.name.data);
+        return NGX_CONF_ERROR;
+    }
+
+    base = ngx_pcalloc(cf->pool, size);
+    if (base == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    n = ngx_read_file(&file, base, size, 0);
+
+    if (ngx_close_file(file.fd) == NGX_FILE_ERROR) {
+        ngx_conf_log_error(NGX_LOG_ALERT, cf, ngx_errno,
+                      ngx_close_file_n " \"%s\" failed", file.name.data);
+    }
+
+    if (n == NGX_ERROR) {
+        return NGX_CONF_ERROR;
+    }
+
+    p->denied_url.data = base;
+    p->denied_url.len = size;
 
     return NGX_CONF_OK;
 }

@@ -1,20 +1,14 @@
 #ifndef __YY_SEC_WAF_H__
 #define __YY_SEC_WAF_H__
 
-/*
-** @file: ngx_yy_sec_waf.h
-** @description: This is the header file for yy sec waf.
-** @author: dw_liqi1<liqi1@yy.com>
-** @date: 2013.07.10
-** Copyright (C) YY, Inc.
-*/
-
 #include <nginx.h>
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <ngx_event.h>
 #include <ngx_string.h>
+
+#include "ddebug.h"
 
 int ngx_yy_sec_waf_unescape(ngx_str_t *str);
 
@@ -28,6 +22,11 @@ u_char *ngx_yy_sec_waf_uitoa(ngx_pool_t *p, ngx_uint_t n);
 
 #define PROCESS_ARGS      1
 #define PROCESS_ARGS_POST 2
+
+#define ACTION_NONE    0
+#define ACTION_LOG     1
+#define ACTION_BLOCK   2
+#define ACTION_ALLOW   4
 
 extern ngx_module_t ngx_http_yy_sec_waf_module;
 
@@ -63,15 +62,21 @@ typedef struct ngx_http_yy_sec_waf_rule {
 } ngx_http_yy_sec_waf_rule_t;
 
 typedef struct {
+    ngx_http_regex_t *regex;
+    ngx_int_t         idx;
+} ngx_http_yy_sec_waf_block_list_t;
+
+typedef struct {
     /* ngx_http_yy_sec_waf_rule_t */
     ngx_array_t *request_header_rules;
     ngx_array_t *request_body_rules;
     ngx_array_t *response_header_rules;
     ngx_array_t *response_body_rules;
+    ngx_array_t *block_list;
 
     ngx_shm_zone_t *shm_zone;
     ngx_str_t  server_ip;
-    ngx_str_t *denied_url;
+    ngx_str_t  denied_url;
     ngx_flag_t enabled;
     ngx_flag_t conn_processor;
     ngx_flag_t body_processor;
@@ -120,7 +125,8 @@ typedef struct {
     ngx_int_t     rule_id;
     ngx_str_t    *gids;
     ngx_str_t    *msg;
-    ngx_str_t    *matched_string;
+    ngx_str_t    *raw_string;
+    ngx_str_t    *full_body;
 } ngx_http_request_ctx_t;
 
 ngx_int_t ngx_http_yy_sec_waf_process_conn(ngx_http_request_ctx_t *ctx);

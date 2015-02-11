@@ -1,11 +1,3 @@
-/*
-** @file: ngx_yy_sec_waf_module.c
-** @description: This is the core module for yy sec waf.
-** @author: dw_liqi1<liqi1@yy.com>
-** @date: 2013.07.10
-** Copyright (C) YY, Inc.
-*/
-
 #include "ngx_yy_sec_waf.h"
 
 static ngx_int_t ngx_http_yy_sec_waf_preconfiguration(ngx_conf_t *cf);
@@ -19,10 +11,13 @@ static char * ngx_http_yy_sec_waf_merge_loc_conf(ngx_conf_t *cf,
 static ngx_http_request_ctx_t* ngx_http_yy_sec_waf_create_ctx(ngx_http_request_t *r,
     ngx_http_yy_sec_waf_loc_conf_t *cf);
 
-extern char * ngx_http_yy_sec_waf_re_read_du_loc_conf(ngx_conf_t *cf,
+extern char * ngx_http_yy_sec_waf_re_read_denied_url_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 extern char * ngx_http_yy_sec_waf_re_read_conf(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+extern char * ngx_http_yy_sec_waf_re_block_list(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+
 extern ngx_int_t ngx_http_yy_sec_waf_process_request(ngx_http_request_t *r,
     ngx_http_yy_sec_waf_loc_conf_t *cf, ngx_http_request_ctx_t *ctx);
 
@@ -73,9 +68,16 @@ static ngx_command_t  ngx_http_yy_sec_waf_commands[] = {
       0,
       NULL },
 
+    { ngx_string("block_list"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_2MORE,
+      ngx_http_yy_sec_waf_re_block_list,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
     { ngx_string("denied_url"),
-      NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF|NGX_CONF_TAKE1,
-      ngx_http_yy_sec_waf_re_read_du_loc_conf,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF|NGX_CONF_TAKE1,
+      ngx_http_yy_sec_waf_re_read_denied_url_conf,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -161,12 +163,14 @@ ngx_http_yy_sec_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->response_header_rules = prev->response_header_rules;
     if (conf->response_body_rules == NULL)
         conf->response_body_rules = prev->response_body_rules;
-    if (conf->denied_url == NULL)
-        conf->denied_url = prev->denied_url;
+    if (conf->block_list == NULL)
+        conf->block_list = prev->block_list;
     if (conf->shm_zone == NULL)
         conf->shm_zone = prev->shm_zone;
     if (conf->server_ip.len == 0)
         conf->server_ip = prev->server_ip;
+    if (conf->denied_url.len == 0)
+        conf->denied_url = prev->denied_url;
 
     ngx_conf_merge_value(conf->enabled, prev->enabled, 1);
 
@@ -334,6 +338,11 @@ ngx_http_yy_sec_waf_handler(ngx_http_request_t *r)
         }
     }
 
+    if (r->internal) {
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[ysec_waf] bypass internal request.");
+        return NGX_DECLINED;
+    }
+
     if (!cf->enabled) {
         ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "[ysec_waf] yy sec waf isn't enabled.");
         return NGX_DECLINED;
@@ -385,7 +394,9 @@ ngx_http_yy_sec_waf_handler(ngx_http_request_t *r)
 
         //Temply hack here, should hook the input filters.
         rc = yy_sec_waf_re_process_normal_rules(r, cf, ctx, REQUEST_HEADER_PHASE);
-        if (rc != NGX_DECLINED) {
+        if (rc != NGX_DECLINED 
+            || ctx->action_level & ACTION_ALLOW
+            || ctx->action_level & ACTION_BLOCK) {
             return rc;
         }
 
@@ -448,17 +459,10 @@ ngx_http_yy_sec_waf_create_ctx(ngx_http_request_t *r,
         return NULL;
     }
 
-    ctx->args.len = r->args.len;
-    ctx->args.data = ngx_pcalloc(r->pool, r->args.len);
-    if (ctx->args.data == NULL) {
-        return NULL;
-    }
-
-    ngx_memcpy(ctx->args.data, r->args.data, ctx->args.len);
-
-    ngx_http_yy_sec_waf_process_spliturl(r, &ctx->args, ctx, PROCESS_ARGS);
+    ngx_http_yy_sec_waf_process_spliturl(r, &r->args, ctx, PROCESS_ARGS);
 
     ctx->process_body_error = 0;
+    ctx->raw_string = &ctx->var;
 
     if (r->method == NGX_HTTP_POST || r->method == NGX_HTTP_PUT) {
 
@@ -473,21 +477,43 @@ ngx_http_yy_sec_waf_create_ctx(ngx_http_request_t *r,
 
     ctx->server_ip = &cf->server_ip;
 
-    ctx->real_client_ip = &ctx->r->connection->addr_text;
-	
-#ifdef NGX_HTTP_X_FORWARDED_FOR
+    ngx_str_t *s = &ctx->r->connection->addr_text;
 
+#ifdef NGX_HTTP_REALIP
+    if (ctx->r->headers_in.x_real_ip != NULL) {
+        s = &ctx->r->headers_in.x_real_ip->value;
+    }
+
+#endif
+#ifdef NGX_HTTP_X_FORWARDED_FOR
+    else {
     #if (nginx_version < 1003014)
         if (ctx->r->headers_in.x_forwarded_for != NULL) {
-            ctx->real_client_ip = &ctx->r->headers_in.x_forwarded_for->value;
+            s = &ctx->r->headers_in.x_forwarded_for->value;
         }
     #else
-        
         if (ctx->r->headers_in.x_forwarded_for.nelts != 0) {
-            ctx->real_client_ip = &((ngx_table_elt_t**)(ctx->r->headers_in.x_forwarded_for.elts))[0]->value;
+            s = &((ngx_table_elt_t**)(ctx->r->headers_in.x_forwarded_for.elts))[0]->value;
         }
     #endif
+
+    }
 #endif
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "[ysec_waf] %V", s);
+    
+    u_char *p = ngx_strlchr(s->data, s->data+s->len, ',');
+    if (p != NULL) {
+        s->len = p-s->data;
+    }
+
+    ctx->real_client_ip = s;
+
+    in_addr_t addr = ngx_inet_addr(s->data, s->len);
+    if (addr == INADDR_NONE) {
+        ctx->real_client_ip = &ctx->r->connection->addr_text;
+    }
 
     //yy_sec_waf_re_cache_init_rbtree(&ctx->cache_rbtree, &ctx->cache_sentinel);
 

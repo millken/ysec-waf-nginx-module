@@ -1,14 +1,6 @@
 #ifndef __YY_SEC_WAF_RE_H__
 #define __YY_SEC_WAF_RE_H__
 
-/*
-** @file: ngx_yy_sec_waf_re.h
-** @description: This is header file for the rule engine of yy sec waf.
-** @author: dw_liqi1<liqi1@yy.com>
-** @date: 2013.11.14
-** Copyright (C) YY, Inc.
-*/
-
 #include "ngx_yy_sec_waf.h"
 
 
@@ -29,11 +21,6 @@
 #define LOG   "log"
 #define BLOCK "block"
 #define ALLOW "allow"
-
-#define ACTION_NONE    0
-#define ACTION_LOG     1
-#define ACTION_BLOCK   2
-#define ACTION_ALLOW   4
 
 #define RULE_MATCH              1
 #define RULE_NO_MATCH           2
